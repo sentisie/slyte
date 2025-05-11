@@ -1,0 +1,52 @@
+bot:
+  token: "your_bot_token_here"
+  admin_ids: [123456789, 987654321]
+  webhook_url: "https://your_domain/webhook"
+
+server:
+  ip: "your_server_ip_here"
+  domain: "example.com"
+  vless_port: 443
+  reality_port: 443
+
+xray:
+  config_path: "/etc/xray/config.json"
+  reality:
+    private_key: "your_private_key_here"
+    public_key: "your_public_key_here"
+    short_id: "123456"
+    server_names: ["www.microsoft.com", "www.amazon.com", "www.cloudflare.com"]
+    dest: "www.google.com:443"
+
+payments:
+  enabled: true
+  crypto_bot_token: "your_cryptobot_token_here"
+  yoomoney_token: "your_yoomoney_token_here"
+  auto_generate_keys: true
+  telegram_stars_enabled: true
+
+trial:
+  enabled: true
+  days: 3
+
+subscription_plans:
+  - days: 30
+    price: 5
+    price_stars: 50
+    title: "1 месяц"
+  - days: 90
+    price: 12
+    price_stars: 120
+    title: "3 месяца"
+  - days: 180
+    price: 20
+    price_stars: 200
+    title: "6 месяцев"
+  - days: 365
+    price: 35
+    price_stars: 350
+    title: "1 год"
+
+paths:
+  logs: "/var/log/xray/"
+  database: "data/users.db" 

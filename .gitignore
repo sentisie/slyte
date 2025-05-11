@@ -1,0 +1,63 @@
+# Конфигурационные файлы с конфиденциальными данными
+config.yaml
+*.env
+.env
+
+# Файлы базы данных
+data/
+*.db
+*.sqlite3
+
+# Директории логов
+logs/
+*.log
+
+# Ключи и сертификаты
+*.pem
+*.key
+*.crt
+*.cert
+
+# Временные файлы Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+.venv/
+
+# Директории и файлы IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Временные файлы тестирования
+test_data/
+test_config/
+temp/
+
+# Кэш pip
+.pip_cache/
+
+# Компиляция и установка
+dist/
+build/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Резервные копии
+*.bak
+*~
+*.backup
+
+# Личные файлы разработки
+TODO.md
+NOTES.md 

@@ -1,0 +1,17 @@
+[Unit]
+Description=VPN Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vpnbot
+ExecStart=/usr/bin/python3 /opt/vpnbot/bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=vpnbot
+
+[Install]
+WantedBy=multi-user.target 
