@@ -92,7 +92,7 @@ class Database:
     
     # Subscription management
     def add_subscription(self, user_id: int, days: int, 
-                        payment_id: str = None) -> Optional[Dict[str, Any]]:
+                        payment_id: str = None, server_id: str = None) -> Optional[Dict[str, Any]]:
         """Add a subscription for the user"""
         user = self.get_user(user_id)
         if not user:
@@ -110,6 +110,7 @@ class Database:
             'expires_at': now + (days * 86400),  # days to seconds
             'payment_id': payment_id,
             'is_active': True,
+            'server_id': server_id,  # Добавляем ID сервера
             'data': {
                 'vless_id': str(uuid.uuid4()),
                 'last_reset': now,
@@ -152,12 +153,23 @@ class Database:
         
         return user['subscriptions']
     
-    def get_active_subscriptions(self, user_id: int) -> List[Dict[str, Any]]:
-        """Get active subscriptions for a user"""
+    def get_active_subscriptions(self, user_id: int, server_id: str = None) -> List[Dict[str, Any]]:
+        """
+        Get active subscriptions for a user, optionally filtered by server ID
+        """
         all_subs = self.get_user_subscriptions(user_id)
         now = time.time()
         
-        return [sub for sub in all_subs if sub['is_active'] and sub['expires_at'] > now]
+        if server_id:
+            # Filter by server ID and active state
+            return [
+                sub for sub in all_subs if 
+                sub['is_active'] and sub['expires_at'] > now and 
+                sub.get('server_id') == server_id
+            ]
+        else:
+            # Filter only by active state
+            return [sub for sub in all_subs if sub['is_active'] and sub['expires_at'] > now]
     
     def deactivate_subscription(self, user_id: int, subscription_id: str) -> bool:
         """Deactivate a subscription"""
@@ -176,8 +188,8 @@ class Database:
     # Payment tracking
     def record_payment(self, user_id: int, payment_id: str, amount: float, 
                      currency: str, status: str = 'pending',
-                     subscription_days: int = None) -> Dict[str, Any]:
-        """Record a payment"""
+                     subscription_days: int = None, server_id: str = None) -> Dict[str, Any]:
+        """Record a payment with optional server ID"""
         if payment_id not in self._data['payments']:
             payment = {
                 'id': payment_id,
@@ -185,6 +197,7 @@ class Database:
                 'amount': amount,
                 'currency': currency,
                 'status': status,
+                'server_id': server_id,  # Добавляем ID сервера
                 'created_at': int(time.time()),
                 'updated_at': int(time.time()),
                 'subscription_days': subscription_days
@@ -262,7 +275,7 @@ class Database:
         return True
     
     def clear_user_ips(self, user_id: int) -> bool:
-        """Clear all IPs for a user"""
+        """Clear all active IPs for a user"""
         user = self.get_user(user_id)
         if not user:
             return False

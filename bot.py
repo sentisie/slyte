@@ -37,8 +37,9 @@ logging.basicConfig(
 
 # Константы для состояний в рамках разговора
 AWAITING_PAYMENT = 'AWAITING_PAYMENT'
-CHECKING_PAYMENT = 'CHECKING_PAYMENT'
 AWAITING_PROTOCOL = 'AWAITING_PROTOCOL'
+AWAITING_SERVER = 'AWAITING_SERVER'
+CHECKING_PAYMENT = 'CHECKING_PAYMENT'
 
 # Функции для форматирования
 def format_bytes(size):
@@ -127,12 +128,29 @@ async def activate_trial(update: Update, context: CallbackContext):
         await query.answer("Вы уже использовали пробный период")
         return
     
+    # Если доступно несколько серверов, показываем выбор сервера
+    available_servers = xray_manager.get_available_servers()
+    if len(available_servers) > 1:
+        # Сохраняем в контексте, что это пробный период
+        context.user_data['is_trial'] = True
+        context.user_data['trial_days'] = config.get_trial_days()
+        
+        # Переходим к выбору сервера
+        await show_server_selection(update, context)
+        return
+    
+    # Если только один сервер, активируем пробный период на нем
+    server_id = None
+    if available_servers:
+        server_id = available_servers[0]['id']
+    
     # Создаем пробную подписку
     trial_days = config.get_trial_days()
     subscription = database.add_subscription(
         user_id=user_id,
         days=trial_days,
-        payment_id=None  # Без платежа
+        payment_id=None,  # Без платежа
+        server_id=server_id  # Добавляем ID сервера
     )
     
     if subscription:
@@ -141,7 +159,7 @@ async def activate_trial(update: Update, context: CallbackContext):
         
         # Создаем пользователя в Xray
         email = f"trial_user_{user_id}_{subscription['id']}"
-        xray_user = xray_manager.add_user(email)
+        xray_user = xray_manager.add_user(email, server_id=server_id)
         
         # Добавляем UUID в данные подписки
         subscription['data']['vless_id'] = xray_user['id']
@@ -225,8 +243,17 @@ async def show_main_menu(update: Update, context: CallbackContext):
         expiry_date = datetime.fromtimestamp(sub['expires_at'])
         time_left = sub['expires_at'] - time.time()
         
+        # Получаем информацию о сервере
+        server_info = ""
+        if 'server_id' in sub and sub['server_id']:
+            server = config.get_server_by_id(sub['server_id'])
+            if server:
+                server_name = server.get('name', f"Server {sub['server_id']}")
+                server_info = f"🌍 Сервер: {server_name}\n"
+        
         title = (
             f"🔹 *Ваша подписка активна*\n\n"
+            f"{server_info}"
             f"⏳ Осталось: {format_time_left(time_left)}\n"
             f"📅 Истекает: {expiry_date.strftime('%d.%m.%Y')}\n"
             f"📲 Выберите действие из меню ниже:"
@@ -252,636 +279,999 @@ async def show_main_menu(update: Update, context: CallbackContext):
             parse_mode='Markdown'
         )
 
-# Обработчики для покупки и управления подпиской
-async def show_prices(update: Update, context: CallbackContext):
-    """Показывает доступные тарифные планы"""
-    plans = get_subscription_plans()
+async def show_server_selection(update: Update, context: CallbackContext):
+    """Показывает меню выбора сервера"""
+    query = update.callback_query
+    if query:
+        await query.answer()
     
-    if not plans:
-        await update.callback_query.answer("Тарифные планы временно недоступны")
+    # Получаем список доступных серверов
+    available_servers = xray_manager.get_available_servers()
+    
+    if not available_servers:
+        # Если серверов нет, сообщаем об ошибке
+        message = "❌ Нет доступных серверов в данный момент. Пожалуйста, попробуйте позже."
+        if query:
+            await query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
         return
     
-    # Создаем текст с описанием планов
-    text = "🔹 *Доступные тарифные планы:*\n\n"
-    
-    for idx, plan in enumerate(plans, 1):
-        stars_price = plan.get('price_stars', int(plan['price'] * 10))
-        text += (
-            f"{idx}. *{plan['title']}*\n"
-            f"   ⏳ Срок: {plan['days']} дней\n"
-            f"   💲 Цена: ${plan['price']} (USDT)\n"
-            f"   ⭐ Звезды: {stars_price} звезд\n\n"
-        )
-    
-    text += "Выберите тарифный план для продолжения:"
-    
-    # Создаем кнопки для выбора плана
-    keyboard = []
-    for idx, plan in enumerate(plans, 1):
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{plan['title']} - ${plan['price']}",
-                callback_data=f"select_plan_{idx-1}"
-            )
-        ])
-    
-    # Проверяем, доступен ли пробный период
-    if config.is_trial_enabled():
-        trial_days = config.get_trial_days()
-        # Проверяем, использовал ли пользователь пробный период
-        user_id = update.effective_user.id
-        all_subs = database.get_user_subscriptions(user_id)
-        trial_used = any(sub.get('is_trial', False) for sub in all_subs)
+    # Если только один сервер, пропускаем выбор
+    if len(available_servers) == 1:
+        server = available_servers[0]
+        context.user_data['selected_server_id'] = server['id']
         
-        if not trial_used:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🎁 Бесплатный пробный период ({trial_days} дня)",
-                    callback_data="activate_trial"
-                )
-            ])
+        # Проверяем, был ли выбран план или это пробный период
+        if 'selected_plan' in context.user_data:
+            await show_payment_options(update, context)
+        elif 'is_trial' in context.user_data and context.user_data['is_trial']:
+            # Активируем пробный период на выбранном сервере
+            await process_trial_activation(update, context)
+        return
+    
+    # Создаем клавиатуру с кнопками выбора сервера
+    keyboard = []
+    for server in available_servers:
+        location_info = f" ({server['location']})" if 'location' in server else ""
+        button_text = f"🌍 {server['name']}{location_info}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"server_{server['id']}")])
     
     # Добавляем кнопку возврата
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_plans")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отвечаем на запрос
-    await update.callback_query.edit_message_text(
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-
-async def select_plan(update: Update, context: CallbackContext):
-    """Обработчик выбора тарифного плана"""
-    query = update.callback_query
+    # Заголовок сообщения
+    title = "🌍 *Выберите сервер*\n\n"
     
-    # Получаем индекс выбранного плана
-    plan_idx = int(query.data.split('_')[-1])
+    # Добавляем описание серверов, если оно есть
+    for server in available_servers:
+        if 'description' in server and server['description']:
+            title += f"*{server['name']}*: {server['description']}\n"
+    
+    if query:
+        await query.edit_message_text(
+            text=title,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            text=title,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def process_server_selection(update: Update, context: CallbackContext):
+    """Обработка выбора сервера"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем ID сервера из данных обратного вызова
+    server_id = query.data.split('_')[1]
+    
+    # Сохраняем выбранный сервер в данных пользователя
+    context.user_data['selected_server_id'] = server_id
+    
+    # Проверяем следующий шаг: платеж или пробный период
+    if 'is_trial' in context.user_data and context.user_data['is_trial']:
+        # Активируем пробный период на выбранном сервере
+        await process_trial_activation(update, context)
+    else:
+        # Переходим к выбору способа оплаты
+        await show_payment_options(update, context)
+
+async def process_trial_activation(update: Update, context: CallbackContext):
+    """Активация пробного периода на выбранном сервере"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Получаем ID выбранного сервера и количество дней пробного периода
+    server_id = context.user_data.get('selected_server_id')
+    trial_days = context.user_data.get('trial_days', config.get_trial_days())
+    
+    # Очищаем данные о пробном периоде
+    if 'is_trial' in context.user_data:
+        del context.user_data['is_trial']
+    if 'trial_days' in context.user_data:
+        del context.user_data['trial_days']
+    
+    # Создаем пробную подписку
+    subscription = database.add_subscription(
+        user_id=user_id,
+        days=trial_days,
+        payment_id=None,  # Без платежа
+        server_id=server_id
+    )
+    
+    if subscription:
+        # Отмечаем подписку как пробную
+        subscription['is_trial'] = True
+        
+        # Создаем пользователя в Xray
+        email = f"trial_user_{user_id}_{subscription['id']}"
+        xray_user = xray_manager.add_user(email, server_id=server_id)
+        
+        # Добавляем UUID в данные подписки
+        subscription['data']['vless_id'] = xray_user['id']
+        
+        # Получаем имя сервера для отображения
+        server_name = "VPN"
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+        
+        # Обновляем информацию пользователя
+        await query.edit_message_text(
+            f"✅ *Поздравляем!*\n\n"
+            f"Ваш пробный период на сервере *{server_name}* активирован на {trial_days} дней.\n"
+            f"Теперь вы можете получить конфигурацию для подключения.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
+            ]])
+        )
+    else:
+        await query.edit_message_text(
+            "❌ Произошла ошибка при активации пробного периода",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Вернуться в меню", callback_data="start")
+            ]])
+        )
+
+# Обработчики для покупки и управления подпиской
+async def show_prices(update: Update, context: CallbackContext):
+    """Показывает список тарифных планов"""
+    query = None
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+    
     plans = get_subscription_plans()
     
-    if plan_idx < 0 or plan_idx >= len(plans):
-        await query.answer("Выбран неверный тарифный план")
+    if not plans:
+        message = "Тарифные планы не настроены. Пожалуйста, свяжитесь с администратором."
+        if query:
+            await query.edit_message_text(message)
+        else:
+            await update.message.reply_text(message)
         return
     
-    # Выбранный план
-    plan = plans[plan_idx]
+    # Создаем клавиатуру с кнопками выбора плана
+    keyboard = []
+    for plan in plans:
+        days = plan.get('days', 0)
+        price = plan.get('price', 0)
+        title = plan.get('title', f"{days} дней")
+        
+        # Создаем текст кнопки
+        button_text = f"{title} - ${price}"
+        
+        # Если включены Telegram Stars, показываем цену в звездах
+        if config.is_telegram_stars_enabled() and 'price_stars' in plan:
+            button_text += f" / {plan['price_stars']} ⭐"
+        
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_{days}")])
     
-    # Сохраняем выбранный план в контексте
-    context.user_data['selected_plan'] = plan
+    # Добавляем кнопку возврата в главное меню
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="start")])
     
-    # Показываем опции оплаты
-    await show_payment_options(update, context, plan)
-
-async def show_payment_options(update: Update, context: CallbackContext, plan=None):
-    """Показывает доступные методы оплаты"""
-    query = update.callback_query
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Получаем план, если не был передан
-    if not plan:
-        plan = context.user_data.get('selected_plan')
+    message = (
+        "💰 *Тарифные планы*\n\n"
+        "Выберите подходящий тарифный план для подписки:\n\n"
+    )
     
-    if not plan:
-        await query.answer("Выберите тарифный план сначала")
-        await show_prices(update, context)
-        return
+    # Добавляем информацию о способах оплаты
+    payment_info = []
     
-    # Получаем доступные платежные системы
-    payment_providers = payment_manager.get_available_providers()
+    if config.get_crypto_bot_token():
+        payment_info.append("• 💎 Криптовалюта через CryptoBot")
     
-    if not payment_providers:
+    if config.is_telegram_stars_enabled():
+        payment_info.append("• ⭐ Telegram Stars")
+    
+    if payment_info:
+        message += "Доступные способы оплаты:\n" + "\n".join(payment_info)
+    
+    if query:
         await query.edit_message_text(
-            "К сожалению, платежные системы временно недоступны. Попробуйте позже или свяжитесь с поддержкой.",
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def select_plan(update: Update, context: CallbackContext):
+    """Обработка выбора тарифного плана"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем количество дней из данных обратного вызова
+    days = int(query.data.split('_')[1])
+    
+    # Находим выбранный план
+    plans = get_subscription_plans()
+    selected_plan = next((p for p in plans if p.get('days') == days), None)
+    
+    if not selected_plan:
+        await query.edit_message_text(
+            "Выбранный тариф не найден. Пожалуйста, выберите другой тариф.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="prices")
+                InlineKeyboardButton("🔙 Назад к тарифам", callback_data="prices")
             ]])
         )
         return
     
-    # Создаем текст
-    text = (
-        f"🔹 *Оплата подписки*\n\n"
-        f"Тарифный план: *{plan['title']}*\n"
-        f"Срок: {plan['days']} дней\n\n"
-        f"Стоимость:\n"
-        f"💲 ${plan['price']} (USDT)\n"
-        f"⭐ {plan.get('price_stars', int(plan['price']*10))} звезд Telegram\n\n"
-        f"Выберите способ оплаты:"
-    )
+    # Сохраняем выбранный план в данных пользователя
+    context.user_data['selected_plan'] = selected_plan
     
-    # Создаем кнопки для выбора способа оплаты
+    # Проверяем количество доступных серверов
+    available_servers = xray_manager.get_available_servers()
+    
+    if len(available_servers) > 1:
+        # Если больше одного сервера, показываем выбор сервера
+        await show_server_selection(update, context)
+    else:
+        # Если только один сервер или нет серверов
+        if available_servers:
+            context.user_data['selected_server_id'] = available_servers[0]['id']
+        else:
+            context.user_data['selected_server_id'] = None
+        
+        # Переходим к выбору способа оплаты
+        await show_payment_options(update, context)
+
+async def show_payment_options(update: Update, context: CallbackContext, plan=None):
+    """Показывает доступные способы оплаты"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Используем план из аргументов или из данных пользователя
+    if not plan and 'selected_plan' in context.user_data:
+        plan = context.user_data['selected_plan']
+    
+    if not plan:
+        await query.edit_message_text(
+            "Произошла ошибка при выборе тарифа. Пожалуйста, попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад к тарифам", callback_data="prices")
+            ]])
+        )
+        return
+    
+    # Проверяем выбранный сервер
+    server_id = context.user_data.get('selected_server_id')
+    
+    # Получаем информацию о сервере для отображения
+    server_info = ""
+    if server_id:
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+            server_location = server.get('location', '')
+            
+            server_info = f"🌍 Сервер: *{server_name}*"
+            if server_location:
+                server_info += f" ({server_location})"
+            server_info += "\n\n"
+    
+    # Создаем список доступных способов оплаты
     keyboard = []
     
-    if "usdt" in payment_providers:
+    # Добавляем кнопку оплаты криптовалютой, если настроен CryptoBot
+    if config.get_crypto_bot_token():
         keyboard.append([
-            InlineKeyboardButton("💲 Оплатить USDT", callback_data="pay_usdt")
+            InlineKeyboardButton(
+                f"💎 Криптовалюта (${plan['price']})", 
+                callback_data=f"pay_crypto_{plan['days']}"
+            )
         ])
     
-    if "telegram_stars" in payment_providers:
+    # Добавляем кнопку оплаты Telegram Stars, если включено
+    if config.is_telegram_stars_enabled() and 'price_stars' in plan:
         keyboard.append([
-            InlineKeyboardButton("⭐ Оплатить звездами Telegram", callback_data="pay_telegram_stars")
-        ])
-    
-    if "cryptobot" in payment_providers:
-        keyboard.append([
-            InlineKeyboardButton("💳 CryptoBot (BTC, ETH, TON)", callback_data="pay_cryptobot")
-        ])
-    
-    if "yoomoney" in payment_providers:
-        keyboard.append([
-            InlineKeyboardButton("💳 YooMoney", callback_data="pay_yoomoney")
+            InlineKeyboardButton(
+                f"⭐ Telegram Stars ({plan['price_stars']} звезд)", 
+                callback_data=f"pay_stars_{plan['days']}"
+            )
         ])
     
     # Добавляем кнопку возврата
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="prices")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="prices")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отвечаем на запрос
+    # Формируем текст сообщения
+    title = plan.get('title', f"{plan['days']} дней")
+    price = plan.get('price', 0)
+    
+    message = (
+        f"💰 *Выбранный тариф: {title}*\n\n"
+        f"{server_info}"
+        f"Стоимость: ${price}\n\n"
+        f"Выберите способ оплаты:"
+    )
+    
     await query.edit_message_text(
-        text=text,
+        text=message,
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
 async def process_payment(update: Update, context: CallbackContext):
-    """Обрабатывает запрос на оплату выбранным методом"""
+    """Обработка запроса на оплату"""
     query = update.callback_query
+    await query.answer()
+    
+    # Получаем данные из callback_data
+    parts = query.data.split('_')
+    payment_method = parts[1]
+    days = int(parts[2])
+    
+    # Находим соответствующий тарифный план
+    plans = get_subscription_plans()
+    plan = next((p for p in plans if p.get('days') == days), None)
+    
+    if not plan:
+        await query.edit_message_text(
+            "Выбранный тариф не найден. Пожалуйста, выберите другой тариф.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад к тарифам", callback_data="prices")
+            ]])
+        )
+        return
+    
+    # Получаем ID выбранного сервера
+    server_id = context.user_data.get('selected_server_id')
+    
+    # Получаем информацию о сервере для отображения
+    server_info = ""
+    if server_id:
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+            server_info = f"🌍 Сервер: *{server_name}*\n\n"
+    
     user_id = update.effective_user.id
+    username = update.effective_user.username or f"user_{user_id}"
     
-    # Получаем метод оплаты
-    payment_method = query.data.split('_')[1]
-    
-    # Особая обработка для Telegram Stars
-    if payment_method == "telegram_stars":
-        # Получаем выбранный план
-        plan = context.user_data.get('selected_plan')
-        if not plan:
-            await query.answer("Выберите тарифный план сначала")
-            await show_prices(update, context)
-            return
-        
-        # Для Telegram Stars мы создаем специальный URL, который будет обработан в самом боте
-        stars_amount = plan.get('price_stars', int(plan['price'] * 10))
-        
-        # Создаем уникальный ID платежа
-        payment_id = str(uuid.uuid4())
+    if payment_method == "crypto":
+        # Генерируем уникальный ID платежа
+        payment_id = f"crypto_{int(time.time())}_{user_id}"
         
         # Записываем платеж в базу данных
         database.record_payment(
             user_id=user_id,
             payment_id=payment_id,
             amount=plan['price'],
-            currency="STARS",
-            status="pending",
-            subscription_days=plan['days']
+            currency='USD',
+            status='pending',
+            subscription_days=days,
+            server_id=server_id
         )
         
-        # Создаем инструкцию для оплаты звездами
-        text = (
-            f"🔹 *Оплата звездами Telegram*\n\n"
-            f"Для оплаты подписки отправьте *{stars_amount} звезд* боту.\n\n"
-            f"1️⃣ Нажмите на иконку ⭐ внизу окна чата\n"
-            f"2️⃣ Укажите количество звезд: {stars_amount}\n"
-            f"3️⃣ Подтвердите отправку\n\n"
-            f"После получения звезд, ваша подписка будет активирована автоматически."
-        )
-        
-        # Создаем кнопки
-        keyboard = [
-            [InlineKeyboardButton("◀️ Назад", callback_data="prices")]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Отвечаем на запрос
+        # Создаем инвойс через CryptoBot
+        try:
+            payment_url = await payment_manager.create_crypto_invoice(
+                payment_id=payment_id,
+                amount=plan['price'],
+                description=f"Подписка VPN на {days} дней"
+            )
+            
+            if payment_url:
+                # Сохраняем данные платежа в контексте
+                context.user_data[AWAITING_PAYMENT] = payment_id
+                
+                keyboard = [
+                    [InlineKeyboardButton("💰 Оплатить", url=payment_url)],
+                    [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{payment_id}")],
+                    [InlineKeyboardButton("🔙 Назад", callback_data="prices")]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"💰 *Оплата криптовалютой*\n\n"
+                    f"{server_info}"
+                    f"Тариф: {plan.get('title', f'{days} дней')}\n"
+                    f"Сумма: ${plan['price']}\n\n"
+                    f"Нажмите кнопку 'Оплатить' для перехода к оплате через CryptoBot. "
+                    f"После оплаты нажмите 'Проверить оплату'.",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+                
+                # Запускаем задачу для автоматической проверки платежа
+                job_name = f"payment_{payment_id}_{user_id}"
+                context.job_queue.run_repeating(
+                    check_payment_job,
+                    interval=30,  # каждые 30 секунд
+                    first=30,     # первая проверка через 30 секунд
+                    data={
+                        'payment_id': payment_id,
+                        'chat_id': update.effective_chat.id,
+                        'message_id': query.message.message_id,
+                        'user_id': user_id,
+                        'server_id': server_id
+                    },
+                    name=job_name
+                )
+                
+                # Запоминаем имя задачи в контексте
+                context.user_data['payment_job'] = job_name
+                
+            else:
+                await query.edit_message_text(
+                    "Произошла ошибка при создании платежа. Пожалуйста, попробуйте позже или выберите другой метод оплаты.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Назад", callback_data="prices")
+                    ]])
+                )
+                
+        except Exception as e:
+            logger.error(f"Error creating crypto payment: {e}")
+            await query.edit_message_text(
+                "Произошла ошибка при создании платежа. Пожалуйста, попробуйте позже или выберите другой метод оплаты.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data="prices")
+                ]])
+            )
+    
+    elif payment_method == "stars":
+        # Для оплаты Telegram Stars переходим в специальный обработчик
+        selected_plan = {'days': days, 'price_stars': plan.get('price_stars', 0)}
+        context.user_data['selected_plan'] = selected_plan
+        context.user_data['server_id'] = server_id
+        await handle_stars_payment(update, context)
+
+async def check_payment_manually(update: Update, context: CallbackContext):
+    """Ручная проверка статуса платежа"""
+    query = update.callback_query
+    await query.answer("Проверяем статус платежа...")
+    
+    # Получаем ID платежа из callback_data
+    payment_id = query.data.split('_')[2]
+    user_id = update.effective_user.id
+    
+    # Получаем информацию о платеже из базы данных
+    payment = database.get_payment(payment_id)
+    
+    if not payment:
         await query.edit_message_text(
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        
-        return
-    
-    # Получаем выбранный план
-    plan = context.user_data.get('selected_plan')
-    if not plan:
-        await query.answer("Выберите тарифный план сначала")
-        await show_prices(update, context)
-        return
-    
-    # Создаем описание платежа
-    description = f"VPN подписка ({plan['title']}) - {plan['days']} дней"
-    
-    # Создаем счет через менеджер платежей
-    success, result = await payment_manager.create_invoice(
-        provider=payment_method,
-        amount=plan['price'],
-        days=plan['days'],
-        description=description,
-        user_id=user_id
-    )
-    
-    if not success:
-        error_msg = result.get('error', 'Неизвестная ошибка')
-        await query.edit_message_text(
-            f"❌ Ошибка создания счета: {error_msg}\n\nПопробуйте другой метод оплаты или свяжитесь с поддержкой.",
+            "Информация о платеже не найдена. Пожалуйста, попробуйте оплатить снова.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data="prices")
+                InlineKeyboardButton("🔙 Назад", callback_data="prices")
             ]])
         )
         return
     
-    # Сохраняем информацию о платеже
-    payment_id = result.get('payment_id')
-    payment_url = result.get('url')
-    expires_at = result.get('expires_at')
-    
-    # Записываем платеж в базу данных
-    database.record_payment(
-        user_id=user_id,
-        payment_id=payment_id,
-        amount=plan['price'],
-        currency="USD",
-        status="pending",
-        subscription_days=plan['days']
-    )
-    
-    # Сохраняем данные платежа в контексте
-    context.user_data['payment_data'] = {
-        'payment_id': payment_id,
-        'provider': payment_method,
-        'expires_at': expires_at,
-        'plan': plan
-    }
-    
-    # Формируем сообщение
-    text = (
-        f"🔹 *Счет для оплаты создан*\n\n"
-        f"Тарифный план: *{plan['title']}*\n"
-        f"Срок: {plan['days']} дней\n"
-        f"Сумма к оплате: *${plan['price']}*\n\n"
-        f"⏳ Счет действителен до: {datetime.fromtimestamp(expires_at).strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"Для оплаты нажмите кнопку 'Оплатить' ниже. После оплаты нажмите 'Проверить оплату'."
-    )
-    
-    # Создаем кнопки
-    keyboard = [
-        [InlineKeyboardButton("💰 Оплатить", url=payment_url)],
-        [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{payment_id}")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="prices")]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Отвечаем на запрос
-    await query.edit_message_text(
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    # Создаем задачу для периодической проверки платежа
-    context.job_queue.run_repeating(
-        check_payment_job,
-        interval=30,  # Проверяем каждые 30 секунд
-        first=10,     # Первая проверка через 10 секунд
-        data={
-            'user_id': user_id,
-            'payment_id': payment_id,
-            'provider': payment_method,
-            'chat_id': update.effective_chat.id,
-            'message_id': query.message.message_id
-        },
-        name=f"payment_{payment_id}"
-    )
-
-async def check_payment_manually(update: Update, context: CallbackContext):
-    """Ручная проверка статуса платежа по запросу пользователя"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    # Получаем ID платежа
-    payment_id = query.data.split('_')[-1]
-    
-    # Получаем информацию о платеже из базы данных
-    payment_info = database.get_payment(payment_id)
-    
-    if not payment_info:
-        await query.answer("Платеж не найден", show_alert=True)
-        return
-    
-    # Проверяем, принадлежит ли платеж этому пользователю
-    if payment_info['user_id'] != user_id:
-        await query.answer("Платеж не найден", show_alert=True)
-        return
-    
-    # Если платеж уже отмечен как оплаченный
-    if payment_info['status'] == 'paid':
-        await query.answer("Платеж уже был обработан", show_alert=True)
-        await show_main_menu(update, context)
-        return
-    
     # Проверяем статус платежа
-    provider = payment_info.get('provider', 'cryptobot')  # По умолчанию cryptobot
-    is_paid, status = await payment_manager.check_payment(provider, payment_id)
+    if payment['status'] == 'completed':
+        # Платеж уже обработан
+        await query.edit_message_text(
+            "✅ Платеж успешно обработан. Ваша подписка активирована.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
+            ]])
+        )
+        return
     
-    if is_paid:
-        # Платеж успешен, обновляем статус и создаем подписку
-        database.update_payment_status(payment_id, 'paid')
+    # Проверяем платеж в платежной системе
+    payment_verified = False
+    
+    if payment_id.startswith('crypto'):
+        # Проверка через CryptoBot
+        payment_verified = await payment_manager.check_crypto_payment(payment_id)
+    
+    if payment_verified:
+        # Обновляем статус платежа в базе данных
+        database.update_payment_status(payment_id, 'completed')
+        
+        # Получаем информацию о сервере
+        server_id = payment.get('server_id')
         
         # Создаем подписку
-        days = payment_info.get('subscription_days', 30)  # По умолчанию 30 дней
-        subscription = database.add_subscription(user_id, days, payment_id)
+        subscription = database.add_subscription(
+            user_id=user_id,
+            days=payment['subscription_days'],
+            payment_id=payment_id,
+            server_id=server_id
+        )
         
         if subscription:
             # Создаем пользователя в Xray
             email = f"user_{user_id}_{subscription['id']}"
-            xray_user = xray_manager.add_user(email)
+            xray_user = xray_manager.add_user(email, server_id=server_id)
             
             # Добавляем UUID в данные подписки
             subscription['data']['vless_id'] = xray_user['id']
             
-            # Показываем сообщение об успешной оплате
+            # Получаем название сервера для отображения
+            server_name = "VPN"
+            if server_id:
+                server = config.get_server_by_id(server_id)
+                if server:
+                    server_name = server.get('name', f"Server {server_id}")
+            
+            # Останавливаем задачу автоматической проверки, если она запущена
+            if 'payment_job' in context.user_data:
+                try:
+                    current_jobs = context.job_queue.get_jobs_by_name(context.user_data['payment_job'])
+                    for job in current_jobs:
+                        job.schedule_removal()
+                    del context.user_data['payment_job']
+                except Exception as e:
+                    logger.error(f"Error removing payment job: {e}")
+            
+            # Очищаем состояние ожидания платежа
+            if AWAITING_PAYMENT in context.user_data:
+                del context.user_data[AWAITING_PAYMENT]
+            
+            # Уведомляем пользователя об успешной оплате
             await query.edit_message_text(
-                "✅ *Оплата успешно получена!*\n\n"
-                "Ваша подписка активирована. Сейчас вы будете перенаправлены в меню управления подпиской.",
+                f"✅ *Оплата успешно проведена!*\n\n"
+                f"Ваша подписка на сервере *{server_name}* активирована на {payment['subscription_days']} дней.\n"
+                f"Нажмите кнопку ниже, чтобы просмотреть данные для подключения.",
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
                 ]])
             )
-            
-            # Останавливаем задачу проверки платежа
-            for job in context.job_queue.get_jobs_by_name(f"payment_{payment_id}"):
-                job.schedule_removal()
-                
-            return
-    elif status == "expired":
-        # Платеж просрочен
-        database.update_payment_status(payment_id, 'expired')
-        
-        await query.edit_message_text(
-            "❌ *Срок действия счета истек*\n\n"
-            "Пожалуйста, создайте новый счет для оплаты.",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Создать новый счет", callback_data="prices")
-            ]])
-        )
-        
-        # Останавливаем задачу проверки платежа
-        for job in context.job_queue.get_jobs_by_name(f"payment_{payment_id}"):
-            job.schedule_removal()
+        else:
+            await query.edit_message_text(
+                "✅ Оплата прошла успешно, но возникла ошибка при активации подписки. Пожалуйста, обратитесь в поддержку.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🆘 Поддержка", callback_data="support")
+                ]])
+            )
     else:
-        # Платеж в процессе или ошибка
-        await query.answer(
-            "Оплата еще не поступила. Пожалуйста, завершите оплату или подождите несколько минут.",
-            show_alert=True
+        # Платеж не найден или не подтвержден
+        await query.edit_message_text(
+            "❌ Платеж не найден или еще не подтвержден. Пожалуйста, убедитесь, что вы завершили оплату и попробуйте проверить снова через некоторое время.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Проверить снова", callback_data=f"check_payment_{payment_id}")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="prices")]
+            ])
         )
 
 async def check_payment_job(context: CallbackContext):
-    """Автоматическая периодическая проверка платежа"""
+    """Автоматическая периодическая проверка статуса платежа"""
     job_data = context.job.data
     
-    user_id = job_data.get('user_id')
     payment_id = job_data.get('payment_id')
-    provider = job_data.get('provider')
     chat_id = job_data.get('chat_id')
     message_id = job_data.get('message_id')
+    user_id = job_data.get('user_id')
+    server_id = job_data.get('server_id')
     
-    # Получаем информацию о платеже из базы данных
-    payment_info = database.get_payment(payment_id)
+    # Проверяем, существует ли платеж и его статус
+    payment = database.get_payment(payment_id)
     
-    if not payment_info or payment_info['status'] in ['paid', 'expired']:
-        # Останавливаем проверку, если платеж уже обработан или не найден
+    if not payment or payment['status'] == 'completed':
+        # Если платеж не найден или уже обработан, останавливаем задачу
         context.job.schedule_removal()
         return
     
-    # Проверяем статус платежа
-    is_paid, status = await payment_manager.check_payment(provider, payment_id)
+    # Проверяем платеж в платежной системе
+    payment_verified = False
     
-    if is_paid:
-        # Платеж успешен, обновляем статус и создаем подписку
-        database.update_payment_status(payment_id, 'paid')
+    if payment_id.startswith('crypto'):
+        # Проверка через CryptoBot
+        payment_verified = await payment_manager.check_crypto_payment(payment_id)
+    
+    if payment_verified:
+        # Обновляем статус платежа в базе данных
+        database.update_payment_status(payment_id, 'completed')
         
         # Создаем подписку
-        days = payment_info.get('subscription_days', 30)
-        subscription = database.add_subscription(user_id, days, payment_id)
+        subscription = database.add_subscription(
+            user_id=user_id,
+            days=payment['subscription_days'],
+            payment_id=payment_id,
+            server_id=server_id
+        )
         
         if subscription:
             # Создаем пользователя в Xray
             email = f"user_{user_id}_{subscription['id']}"
-            xray_user = xray_manager.add_user(email)
+            xray_user = xray_manager.add_user(email, server_id=server_id)
             
             # Добавляем UUID в данные подписки
             subscription['data']['vless_id'] = xray_user['id']
             
-            # Отправляем сообщение пользователю
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=(
-                    "✅ *Оплата успешно получена!*\n\n"
-                    "Ваша подписка активирована. Перейдите в меню управления подпиской."
-                ),
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
-                ]])
-            )
+            # Получаем название сервера для отображения
+            server_name = "VPN"
+            if server_id:
+                server = config.get_server_by_id(server_id)
+                if server:
+                    server_name = server.get('name', f"Server {server_id}")
             
-            context.job.schedule_removal()
+            # Уведомляем пользователя об успешной оплате
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"✅ *Оплата успешно проведена!*\n\n"
+                         f"Ваша подписка на сервере *{server_name}* активирована на {payment['subscription_days']} дней.\n"
+                         f"Нажмите кнопку ниже, чтобы просмотреть данные для подключения.",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
+                    ]])
+                )
+            except Exception as e:
+                logger.error(f"Error updating message after payment: {e}")
         
-    elif status == "expired":
-        # Платеж просрочен
-        database.update_payment_status(payment_id, 'expired')
-        
-        # Отправляем сообщение пользователю
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=(
-                "❌ *Срок действия счета истек*\n\n"
-                "Пожалуйста, создайте новый счет для оплаты."
-            ),
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Создать новый счет", callback_data="prices")
-            ]])
-        )
-        
-        context.job.schedule_removal() 
+        # Останавливаем задачу после успешной обработки платежа
+        context.job.schedule_removal()
 
 # Обработчики для управления подпиской
 async def show_subscription(update: Update, context: CallbackContext):
-    """Показывает информацию о подписке пользователя"""
-    query = update.callback_query
+    """Показывает информацию о подписке пользователя и конфигурации VPN"""
+    query = None
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+    
     user_id = update.effective_user.id
     
-    # Получаем активные подписки
+    # Получаем активные подписки пользователя
     active_subs = database.get_active_subscriptions(user_id)
     
     if not active_subs:
-        # Нет активных подписок
-        await query.edit_message_text(
-            "У вас нет активных подписок. Выберите тарифный план для покупки.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💰 Тарифы и оплата", callback_data="prices"),
-                InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")
-            ]])
+        # У пользователя нет активных подписок
+        message = (
+            "У вас нет активных подписок VPN.\n\n"
+            "Выберите тарифный план для покупки новой подписки."
         )
+        
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Тарифы и оплата", callback_data="prices")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+        ])
+        
+        if query:
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(message, reply_markup=reply_markup)
         return
     
-    # Берем первую активную подписку
-    sub = active_subs[0]
+    # Если у пользователя несколько активных подписок, показываем список для выбора
+    if len(active_subs) > 1:
+        keyboard = []
+        for sub in active_subs:
+            # Получаем информацию о сервере
+            server_name = "VPN"
+            if 'server_id' in sub and sub['server_id']:
+                server = config.get_server_by_id(sub['server_id'])
+                if server:
+                    server_name = server.get('name', f"Server {sub['server_id']}")
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{server_name}", 
+                    callback_data=f"subscription_{sub['id']}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="start")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = "У вас несколько активных подписок VPN. Выберите подписку для просмотра:"
+        
+        if query:
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(message, reply_markup=reply_markup)
+        return
     
-    # Получаем VLESS-ID
-    vless_id = sub['data'].get('vless_id', '❌ Неизвестно')
+    # Если только одна активная подписка, показываем ее
+    subscription = active_subs[0]
     
-    # Получаем статистику трафика
-    email = f"user_{user_id}_{sub['id']}"
-    traffic_stats = xray_manager.get_user_traffic(email)
+    # Получаем информацию о сервере
+    server_info = ""
+    server_id = subscription.get('server_id')
+    if server_id:
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+            server_location = server.get('location', '')
+            
+            server_info = f"🌍 Сервер: *{server_name}*"
+            if server_location:
+                server_info += f" ({server_location})"
+            server_info += "\n\n"
     
-    # Формируем информацию о подписке
-    expiry_date = datetime.fromtimestamp(sub['expires_at'])
-    time_left = sub['expires_at'] - time.time()
-    created_date = datetime.fromtimestamp(sub['created_at'])
+    # Формируем информацию о сроке действия подписки
+    expiry_date = datetime.fromtimestamp(subscription['expires_at'])
+    time_left = subscription['expires_at'] - time.time()
     
-    # Генерируем VLESS-ссылку
-    vless_link = xray_manager.generate_vless_link(vless_id, email)
+    # Получаем данные для подключения
+    vless_id = subscription['data'].get('vless_id', 'unknown')
     
-    text = (
-        f"🔹 *Информация о подписке*\n\n"
-        f"📅 Дата создания: {created_date.strftime('%d.%m.%Y')}\n"
-        f"⏳ Действует до: {expiry_date.strftime('%d.%m.%Y')} ({format_time_left(time_left)})\n\n"
-        f"📊 Использовано трафика:\n"
-        f"  ⬇️ Скачано: {format_bytes(traffic_stats['download'])}\n"
-        f"  ⬆️ Загружено: {format_bytes(traffic_stats['upload'])}\n"
-        f"  📈 Всего: {format_bytes(traffic_stats['total'])}\n\n"
-        f"🆔 Ваш VLESS ID:\n`{vless_id}`\n\n"
-        f"🔗 Ссылка для настройки:\n`{vless_link}`"
+    # Генерируем ссылки на конфигурацию
+    email = f"user_{user_id}_{subscription['id']}"
+    reality_link = xray_manager.generate_vless_link(vless_id, email, "reality", server_id)
+    websocket_link = xray_manager.generate_vless_link(vless_id, email, "websocket", server_id)
+    
+    # Формируем сообщение с информацией о подписке
+    message = (
+        f"🔹 *Ваша подписка*\n\n"
+        f"{server_info}"
+        f"⏳ Осталось: {format_time_left(time_left)}\n"
+        f"📅 Истекает: {expiry_date.strftime('%d.%m.%Y')}\n\n"
+        f"🔑 *Данные для подключения:*\n\n"
+        f"🆔 UUID: `{vless_id}`\n\n"
+        f"Выберите протокол для получения настроек:"
     )
     
-    # Создаем кнопки
+    # Создаем клавиатуру с кнопками для конфигураций и QR-кодов
     keyboard = [
-        [InlineKeyboardButton("📱 QR-код", callback_data="qr_code")],
-        [InlineKeyboardButton("🔄 Обновить", callback_data="my_subscription")],
-        [InlineKeyboardButton("💰 Продлить подписку", callback_data="prices")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
+        [
+            InlineKeyboardButton("⚡ VLESS Reality", callback_data=f"protocol_reality_{subscription['id']}"),
+            InlineKeyboardButton("🌐 WebSocket+TLS", callback_data=f"protocol_websocket_{subscription['id']}")
+        ],
+        [
+            InlineKeyboardButton("📱 QR Reality", callback_data=f"qr_reality_{subscription['id']}"),
+            InlineKeyboardButton("📱 QR WebSocket", callback_data=f"qr_websocket_{subscription['id']}")
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data="start")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отвечаем на запрос
+    if query:
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def show_protocol_config(update: Update, context: CallbackContext):
+    """Показывает конфигурацию для выбранного протокола"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем данные из callback_data
+    parts = query.data.split('_')
+    protocol = parts[1]
+    subscription_id = parts[2]
+    
+    user_id = update.effective_user.id
+    
+    # Находим подписку по ID
+    active_subs = database.get_active_subscriptions(user_id)
+    subscription = next((s for s in active_subs if s['id'] == subscription_id), None)
+    
+    if not subscription:
+        await query.edit_message_text(
+            "Подписка не найдена или истекла. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="start")
+            ]])
+        )
+        return
+    
+    # Получаем ID сервера
+    server_id = subscription.get('server_id')
+    
+    # Генерируем ссылку на конфигурацию
+    vless_id = subscription['data'].get('vless_id', 'unknown')
+    email = f"user_{user_id}_{subscription['id']}"
+    
+    config_link = xray_manager.generate_vless_link(vless_id, email, protocol, server_id)
+    
+    # Формируем название протокола для отображения
+    protocol_name = "VLESS Reality" if protocol == "reality" else "VLESS WebSocket+TLS"
+    
+    message = (
+        f"🔹 *Конфигурация {protocol_name}*\n\n"
+        f"Скопируйте ссылку ниже и импортируйте ее в приложение VLESS/V2ray:\n\n"
+        f"`{config_link}`\n\n"
+        f"Или используйте QR-код для быстрой настройки."
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(f"📱 QR-код", callback_data=f"qr_{protocol}_{subscription_id}")],
+        [InlineKeyboardButton("🔙 Назад к подписке", callback_data="my_subscription")],
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await query.edit_message_text(
-        text=text,
+        message,
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
 async def show_qr_code(update: Update, context: CallbackContext):
-    """Генерирует и отправляет QR-код для VLESS-конфигурации"""
+    """Показывает QR-код для выбранного протокола"""
     query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем данные из callback_data
+    parts = query.data.split('_')
+    protocol = parts[1]
+    subscription_id = parts[2]
+    
     user_id = update.effective_user.id
     
-    # Получаем активные подписки
+    # Находим подписку по ID
     active_subs = database.get_active_subscriptions(user_id)
+    subscription = next((s for s in active_subs if s['id'] == subscription_id), None)
     
-    if not active_subs:
-        # Нет активных подписок
+    if not subscription:
         await query.edit_message_text(
-            "У вас нет активных подписок. Выберите тарифный план для покупки.",
+            "Подписка не найдена или истекла. Пожалуйста, вернитесь в главное меню.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💰 Тарифы и оплата", callback_data="prices"),
-                InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")
+                InlineKeyboardButton("🔙 Назад", callback_data="start")
             ]])
         )
         return
     
-    # Берем первую активную подписку
-    sub = active_subs[0]
+    # Получаем ID сервера
+    server_id = subscription.get('server_id')
     
-    # Получаем VLESS-ID
-    vless_id = sub['data'].get('vless_id')
+    # Генерируем ссылку для QR-кода
+    vless_id = subscription['data'].get('vless_id', 'unknown')
+    email = f"user_{user_id}_{subscription['id']}"
     
-    if not vless_id:
-        await query.answer("Ошибка: отсутствует ID конфигурации", show_alert=True)
-        return
-    
-    # Генерируем VLESS-ссылку
-    email = f"user_{user_id}_{sub['id']}"
-    vless_link = xray_manager.generate_vless_link(vless_id, email)
+    config_link = xray_manager.generate_vless_link(vless_id, email, protocol, server_id)
     
     # Генерируем QR-код
-    qr_image = generate_vless_qr(vless_link, title=f"VPN - {email}")
+    qr_image = generate_vless_qr(config_link)
     
-    # Сначала отвечаем на callback-запрос, чтобы убрать часы загрузки
-    await query.answer()
-    
-    # Отправляем новое сообщение с QR-кодом
-    await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=InputFile(qr_image, filename="vless_config.png"),
-        caption=(
-            f"🔹 *QR-код для настройки VLESS*\n\n"
-            f"Отсканируйте этот QR-код в вашем VPN-клиенте для автоматической настройки подключения.\n\n"
-            f"👉 *ID:* `{vless_id}`\n\n"
-            f"👉 *Ссылка:*\n`{vless_link}`"
-        ),
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("◀️ Назад к подписке", callback_data="my_subscription")
-        ]])
-    )
-    
-    # Удаляем предыдущее сообщение с меню
-    await query.delete_message()
+    if qr_image:
+        # Преобразуем изображение в байты для отправки
+        img_byte_arr = io.BytesIO()
+        qr_image.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        # Формируем название протокола для отображения
+        protocol_name = "VLESS Reality" if protocol == "reality" else "VLESS WebSocket+TLS"
+        
+        # Отправляем QR-код
+        await query.message.reply_photo(
+            photo=InputFile(img_byte_arr),
+            caption=f"📱 QR-код для {protocol_name}\n\nОтсканируйте этот QR-код с помощью вашего VPN-клиента для автоматической настройки."
+        )
+        
+        # Возвращаем к информации о подписке
+        await show_subscription(update, context)
+    else:
+        await query.edit_message_text(
+            "Произошла ошибка при генерации QR-кода. Пожалуйста, попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="my_subscription")
+            ]])
+        )
 
 async def show_traffic_stats(update: Update, context: CallbackContext):
     """Показывает статистику использования трафика"""
-    query = update.callback_query
+    query = None
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+    
     user_id = update.effective_user.id
     
-    # Получаем активные подписки
+    # Получаем активные подписки пользователя
     active_subs = database.get_active_subscriptions(user_id)
     
     if not active_subs:
-        # Нет активных подписок
-        await query.answer("У вас нет активных подписок", show_alert=True)
+        message = "У вас нет активных подписок для проверки статистики."
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Назад", callback_data="start")
+        ]])
+        
+        if query:
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(message, reply_markup=reply_markup)
         return
     
-    # Берем первую активную подписку
-    sub = active_subs[0]
+    # Если у пользователя несколько активных подписок, показываем список для выбора
+    if len(active_subs) > 1:
+        keyboard = []
+        for sub in active_subs:
+            # Получаем информацию о сервере
+            server_name = "VPN"
+            if 'server_id' in sub and sub['server_id']:
+                server = config.get_server_by_id(sub['server_id'])
+                if server:
+                    server_name = server.get('name', f"Server {sub['server_id']}")
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"📊 {server_name}", 
+                    callback_data=f"traffic_{sub['id']}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="start")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = "У вас несколько активных подписок. Выберите подписку для просмотра статистики:"
+        
+        if query:
+            await query.edit_message_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(message, reply_markup=reply_markup)
+        return
     
-    # Получаем статистику трафика
-    email = f"user_{user_id}_{sub['id']}"
-    traffic_stats = xray_manager.get_user_traffic(email)
+    # Если только одна активная подписка, показываем ее статистику
+    subscription = active_subs[0]
+    subscription_id = subscription['id']
     
-    # Формируем текст со статистикой
-    text = (
-        f"🔹 *Статистика использования трафика*\n\n"
-        f"📊 Текущий период:\n"
-        f"  ⬇️ Скачано: {format_bytes(traffic_stats['download'])}\n"
-        f"  ⬆️ Загружено: {format_bytes(traffic_stats['upload'])}\n"
-        f"  📈 Всего: {format_bytes(traffic_stats['total'])}\n\n"
+    # Проверяем, была ли это конкретная подписка, выбранная пользователем
+    if query and query.data.startswith('traffic_'):
+        subscription_id = query.data.split('_')[1]
+        subscription = next((s for s in active_subs if s['id'] == subscription_id), None)
+        if not subscription:
+            await query.edit_message_text(
+                "Подписка не найдена или истекла. Пожалуйста, вернитесь в главное меню.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data="start")
+                ]])
+            )
+            return
+    
+    # Получаем ID сервера
+    server_id = subscription.get('server_id')
+    
+    # Получаем информацию о сервере
+    server_info = ""
+    if server_id:
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+            server_location = server.get('location', '')
+            
+            server_info = f"🌍 Сервер: *{server_name}*"
+            if server_location:
+                server_info += f" ({server_location})"
+            server_info += "\n\n"
+    
+    # Получаем статистику использования трафика из базы данных
+    traffic_used = subscription['data'].get('traffic_used', 0)
+    
+    # Получаем реальную статистику из Xray
+    email = f"user_{user_id}_{subscription['id']}"
+    xray_traffic = xray_manager.get_user_traffic(email, server_id)
+    
+    # Обновляем данные в базе, если есть реальные данные
+    total_traffic = xray_traffic['total']
+    if total_traffic > 0:
+        subscription['data']['traffic_used'] = total_traffic
+    
+    # Форматируем данные для отображения
+    uplink = format_bytes(xray_traffic['uplink'])
+    downlink = format_bytes(xray_traffic['downlink'])
+    total = format_bytes(xray_traffic['total'])
+    
+    # Формируем сообщение со статистикой
+    message = (
+        f"📊 *Статистика использования трафика*\n\n"
+        f"{server_info}"
+        f"📤 Отправлено: {uplink}\n"
+        f"📥 Получено: {downlink}\n"
+        f"📉 Всего: {total}\n\n"
+        f"Статистика обновляется в реальном времени."
     )
     
-    # Создаем кнопки
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data="traffic")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="my_subscription")]
-    ]
-    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="start")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Отвечаем на запрос
-    await query.edit_message_text(
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    if query:
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def show_support_info(update: Update, context: CallbackContext):
     """Показывает информацию о связи с поддержкой"""
@@ -957,40 +1347,27 @@ async def show_admin_panel(update: Update, context: CallbackContext):
 
 # Обработчик callback-запросов
 async def button_handler(update: Update, context: CallbackContext):
-    """Обрабатывает нажатия на inline-кнопки"""
+    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     data = query.data
     
-    # Сначала отвечаем на callback-запрос, чтобы убрать часы загрузки
-    await query.answer()
-    
-    # Обрабатываем разные типы callback-запросов
-    if data == "back_to_main":
+    if data == "start":
         await show_main_menu(update, context)
     
     elif data == "prices":
         await show_prices(update, context)
     
-    elif data.startswith("select_plan_"):
-        await select_plan(update, context)
-    
     elif data == "buy_subscription":
         await show_prices(update, context)
-    
-    elif data.startswith("pay_"):
-        await process_payment(update, context)
-    
-    elif data.startswith("check_payment_"):
-        await check_payment_manually(update, context)
     
     elif data == "my_subscription":
         await show_subscription(update, context)
     
-    elif data == "qr_code":
-        await show_qr_code(update, context)
-    
     elif data == "traffic":
         await show_traffic_stats(update, context)
+    
+    elif data == "qr_code":
+        await show_subscription(update, context)  # Переходим к выбору протокола
     
     elif data == "support":
         await show_support_info(update, context)
@@ -1001,121 +1378,150 @@ async def button_handler(update: Update, context: CallbackContext):
     elif data == "activate_trial":
         await activate_trial(update, context)
     
-    # Можно добавить другие обработчики здесь
+    elif data.startswith("plan_"):
+        await select_plan(update, context)
+    
+    elif data.startswith("pay_"):
+        await process_payment(update, context)
+    
+    elif data.startswith("check_payment_"):
+        await check_payment_manually(update, context)
+    
+    elif data.startswith("protocol_"):
+        await show_protocol_config(update, context)
+    
+    elif data.startswith("qr_"):
+        await show_qr_code(update, context)
+    
+    elif data.startswith("subscription_"):
+        # ID подписки передается в context и затем используется в show_subscription
+        subscription_id = data.split('_')[1]
+        context.user_data['selected_subscription_id'] = subscription_id
+        await show_subscription(update, context)
+    
+    elif data.startswith("traffic_"):
+        await show_traffic_stats(update, context)
+    
+    elif data == "back_to_plans":
+        # Если возвращаемся из выбора сервера, очищаем выбранный сервер
+        if 'selected_server_id' in context.user_data:
+            del context.user_data['selected_server_id']
+        await show_prices(update, context)
+    
+    elif data.startswith("server_"):
+        # Обработка выбора сервера
+        await process_server_selection(update, context)
+    
+    elif data == "show_server_selection":
+        await show_server_selection(update, context)
+    
+    else:
+        await query.answer("Неизвестная команда")
 
 # Обработчик звезд Telegram
 async def handle_stars_payment(update: Update, context: CallbackContext):
-    """Обработка событий оплаты звездами Telegram"""
-    if update.message and update.message.forward_from and update.message.forward_from.id == 777000:
-        # Это сообщение о звездах от Telegram
-        user_id = update.effective_user.id
-        
-        # Примерный формат сообщения: "You received 50 stars from User"
-        message_text = update.message.text
-        
-        if "received" in message_text and "stars" in message_text:
-            try:
-                # Извлекаем количество звезд
-                parts = message_text.split()
-                stars_index = parts.index("received") + 1
-                stars_count = int(parts[stars_index])
-                
-                logger.info(f"Получена оплата звездами от пользователя {user_id}: {stars_count} звезд")
-                
-                # Получаем активные ожидающие платежи пользователя
-                user_payments = database.get_user_payments(user_id)
-                pending_payments = [p for p in user_payments if p['status'] == 'pending' and p.get('currency') == 'STARS']
-                
-                if pending_payments:
-                    # Берем последний ожидающий платеж
-                    payment = pending_payments[-1]
-                    payment_id = payment['payment_id']
-                    days = payment['subscription_days']
-                    
-                    # Расчет необходимого количества звезд
-                    required_stars = payment.get('price_stars', int(payment['amount'] * 10))
-                    
-                    if stars_count >= required_stars:
-                        # Достаточно звезд для оплаты
-                        # Обновляем статус платежа
-                        database.update_payment_status(payment_id, 'paid')
-                        
-                        # Создаем подписку
-                        subscription = database.add_subscription(user_id, days, payment_id)
-                        
-                        if subscription:
-                            # Создаем пользователя в Xray
-                            email = f"user_{user_id}_{subscription['id']}"
-                            xray_user = xray_manager.add_user(email)
-                            
-                            # Добавляем UUID в данные подписки
-                            subscription['data']['vless_id'] = xray_user['id']
-                            
-                            # Отправляем сообщение об успешной оплате
-                            await update.message.reply_text(
-                                "✅ *Оплата звездами получена!*\n\n"
-                                f"Ваша подписка на {days} дней активирована.",
-                                parse_mode='Markdown',
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("🔑 Моя подписка", callback_data="my_subscription")
-                                ]])
-                            )
-                            return
-                        
-                    else:
-                        # Недостаточно звезд
-                        await update.message.reply_text(
-                            f"❌ Получено {stars_count} звезд, но для оплаты подписки нужно {required_stars} звезд.",
-                            reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton("💰 Просмотреть тарифы", callback_data="prices")
-                            ]])
-                        )
-                        return
-            
-            except Exception as e:
-                logger.error(f"Error processing Stars payment: {e}")
-                
-        # Если не удалось обработать платеж
-        await update.message.reply_text(
-            "Спасибо за звезды! К сожалению, мы не смогли найти соответствующий платеж. "
-            "Пожалуйста, выберите тарифный план и выполните оплату через меню бота.",
+    """Обработка оплаты через Telegram Stars"""
+    query = update.callback_query
+    
+    if not config.is_telegram_stars_enabled():
+        await query.edit_message_text(
+            "Оплата через Telegram Stars временно недоступна. Пожалуйста, выберите другой способ оплаты.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💰 Просмотреть тарифы", callback_data="prices")
+                InlineKeyboardButton("🔙 Назад", callback_data="prices")
             ]])
         )
+        return
+    
+    # Получаем план и информацию о сервере
+    selected_plan = context.user_data.get('selected_plan')
+    server_id = context.user_data.get('selected_server_id')
+    
+    if not selected_plan or 'price_stars' not in selected_plan:
+        await query.edit_message_text(
+            "Произошла ошибка при обработке платежа. Пожалуйста, выберите тариф снова.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="prices")
+            ]])
+        )
+        return
+    
+    # Генерируем уникальный ID платежа
+    user_id = update.effective_user.id
+    payment_id = f"stars_{int(time.time())}_{user_id}"
+    
+    # Получаем информацию о сервере для отображения
+    server_info = ""
+    if server_id:
+        server = config.get_server_by_id(server_id)
+        if server:
+            server_name = server.get('name', f"Server {server_id}")
+            server_info = f"🌍 Сервер: *{server_name}*\n\n"
+    
+    # Создаем запись о платеже в базе данных
+    database.record_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        amount=selected_plan.get('price_stars', 0),
+        currency='STARS',
+        status='pending',
+        subscription_days=selected_plan.get('days', 30),
+        server_id=server_id
+    )
+    
+    # Сохраняем ID платежа в контексте
+    context.user_data[AWAITING_PAYMENT] = payment_id
+    
+    # Создаем сообщение с инструкциями для оплаты звездами
+    stars_amount = selected_plan.get('price_stars', 0)
+    message = (
+        f"⭐ *Оплата с помощью Telegram Stars*\n\n"
+        f"{server_info}"
+        f"Тариф: {selected_plan.get('days')} дней\n"
+        f"Стоимость: {stars_amount} звезд\n\n"
+        f"Для оплаты, пожалуйста, отправьте {stars_amount} звезд в этот чат.\n"
+        f"После отправки звезд, нажмите кнопку 'Я отправил звезды' для подтверждения платежа."
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Я отправил звезды", callback_data=f"check_stars_{payment_id}")],
+        [InlineKeyboardButton("🔙 Отмена", callback_data="prices")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Обновляем сообщение с инструкциями для оплаты
+    await query.edit_message_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    
+    # Устанавливаем состояние ожидания подтверждения оплаты
+    context.user_data[CHECKING_PAYMENT] = True
 
 # Функция для запуска бота
 def main():
-    """Запускает бота"""
-    # Получаем токен из конфигурации
-    bot_token = config.get_bot_token()
-    
-    if not bot_token:
-        logger.error("Bot token not configured. Set it in config.yaml")
-        return
-    
+    """Основная функция для запуска бота"""
     # Создаем экземпляр приложения
-    application = Application.builder().token(bot_token).build()
+    application = Application.builder().token(config.get_bot_token()).build()
     
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("subscription", lambda update, context: show_main_menu(update, context)))
-    application.add_handler(CommandHandler("prices", lambda update, context: show_prices(update, {"callback_query": update})))
-    application.add_handler(CommandHandler("qr", lambda update, context: show_qr_code(update, {"callback_query": update})))
-    application.add_handler(CommandHandler("traffic", lambda update, context: show_traffic_stats(update, {"callback_query": update})))
-    application.add_handler(CommandHandler("admin", lambda update, context: show_admin_panel(update, {"callback_query": update})))
+    application.add_handler(CommandHandler("subscription", lambda update, context: show_subscription(update, context)))
+    application.add_handler(CommandHandler("prices", lambda update, context: show_prices(update, context)))
+    application.add_handler(CommandHandler("qr", lambda update, context: show_subscription(update, context)))
+    application.add_handler(CommandHandler("traffic", lambda update, context: show_traffic_stats(update, context)))
+    application.add_handler(CommandHandler("support", lambda update, context: show_support_info(update, context)))
+    application.add_handler(CommandHandler("admin", lambda update, context: show_admin_panel(update, context) if is_admin(update.effective_user.id) else start_command(update, context)))
     
-    # Добавляем обработчик callback-запросов
+    # Добавляем обработчик для кнопок
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Добавляем обработчик для звезд Telegram
-    application.add_handler(MessageHandler(filters.TEXT & filters.FORWARDED, handle_stars_payment))
-    
-    logger.info("Бот настроен с поддержкой автогенерации ключей Reality, пробного периода и оплаты через USDT и звезды Telegram")
+    # Добавляем обработчик для всех сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: show_main_menu(update, context)))
     
     # Запускаем бота
-    logger.info("Starting bot...")
     application.run_polling()
 
 if __name__ == "__main__":

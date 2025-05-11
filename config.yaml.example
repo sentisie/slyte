@@ -3,25 +3,46 @@ bot:
   admin_ids: [123456789, 987654321]
   webhook_url: "https://your_domain/webhook"
 
-server:
-  ip: "your_server_ip_here"
-  domain: "example.com"
-  vless_port: 443
-  reality_port: 443
-
-xray:
-  config_path: "/etc/xray/config.json"
-  reality:
-    private_key: "your_private_key_here"
-    public_key: "your_public_key_here"
-    short_id: "123456"
-    server_names: ["www.microsoft.com", "www.amazon.com", "www.cloudflare.com"]
-    dest: "www.google.com:443"
+# Массив серверов вместо одного сервера
+servers:
+  - id: "server1"  # Уникальный идентификатор сервера
+    name: "Server 1"  # Имя для отображения пользователям
+    ip: "your_server_ip_here"
+    domain: "example.com"
+    vless_port: 443
+    reality_port: 443
+    xray:
+      config_path: "/etc/xray/config.json"
+      reality:
+        private_key: "your_private_key_here"
+        public_key: "your_public_key_here"
+        short_id: "123456"
+        server_names: ["www.microsoft.com", "www.amazon.com", "www.cloudflare.com"]
+        dest: "www.google.com:443"
+    location: "Netherlands"  # Расположение сервера (опционально)
+    description: "Fast European server"  # Описание сервера (опционально)
+  
+  # Пример второго сервера
+  - id: "server2"
+    name: "Server 2"
+    ip: "your_second_server_ip_here"
+    domain: "example2.com"
+    vless_port: 443
+    reality_port: 443
+    xray:
+      config_path: "/etc/xray/config2.json"
+      reality:
+        private_key: "your_private_key_here"
+        public_key: "your_public_key_here"
+        short_id: "789012"
+        server_names: ["www.microsoft.com", "www.amazon.com", "www.cloudflare.com"]
+        dest: "www.google.com:443"
+    location: "Singapore"
+    description: "Optimized for Asia"
 
 payments:
   enabled: true
   crypto_bot_token: "your_cryptobot_token_here"
-  yoomoney_token: "your_yoomoney_token_here"
   auto_generate_keys: true
   telegram_stars_enabled: true
 

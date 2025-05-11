@@ -55,12 +55,53 @@ class Config:
         """Get admin IDs from config"""
         return self.get('bot.admin_ids', [])
     
-    def get_server_details(self) -> Dict[str, Any]:
-        """Get server details"""
-        return self.get('server', {})
+    def get_servers(self) -> List[Dict[str, Any]]:
+        """Get list of all servers"""
+        return self.get('servers', [])
     
-    def get_xray_config(self) -> Dict[str, Any]:
-        """Get Xray configuration"""
+    def get_server_by_id(self, server_id: str) -> Optional[Dict[str, Any]]:
+        """Get server configuration by server ID"""
+        servers = self.get_servers()
+        for server in servers:
+            if server.get('id') == server_id:
+                return server
+        return None
+    
+    def get_default_server(self) -> Optional[Dict[str, Any]]:
+        """Get default server (first in list)"""
+        servers = self.get_servers()
+        if servers:
+            return servers[0]
+        return None
+    
+    def get_server_details(self, server_id: str = None) -> Dict[str, Any]:
+        """Get server details by ID, or default if ID not specified"""
+        if server_id:
+            server = self.get_server_by_id(server_id)
+            if server:
+                return server
+        
+        # Обратная совместимость со старой конфигурацией
+        legacy_server = self.get('server', {})
+        if legacy_server:
+            return legacy_server
+            
+        # Если нет старой конфигурации, возвращаем первый сервер
+        server = self.get_default_server()
+        if server:
+            return server
+            
+        return {}
+    
+    def get_xray_config(self, server_id: str = None) -> Dict[str, Any]:
+        """Get Xray configuration for specific server or default"""
+        server = self.get_server_details(server_id)
+        
+        # Проверяем, есть ли xray в конфигурации сервера
+        if 'xray' in server:
+            return server.get('xray', {})
+        
+        # Обратная совместимость
         return self.get('xray', {})
     
     def get_payment_config(self) -> Dict[str, Any]:
@@ -78,10 +119,6 @@ class Config:
     def get_crypto_bot_token(self) -> Optional[str]:
         """Get CryptoBot token if configured"""
         return self.get('payments.crypto_bot_token')
-    
-    def get_yoomoney_token(self) -> Optional[str]:
-        """Get YooMoney token if configured"""
-        return self.get('payments.yoomoney_token')
     
     def is_auto_generate_keys_enabled(self) -> bool:
         """Check if auto generation of keys is enabled"""
